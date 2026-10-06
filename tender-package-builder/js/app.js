@@ -1,5 +1,7 @@
-/* Phase 3 Part 2: exact duplicate detection (SHA-256) + document matching.
- * Phase 2 UI and Phase 3 Part 1 upload flow preserved. No expiry/final-status/generation.
+/* Phase 5: final PDF package generation wired to the Generate button.
+ * Cover (A4, page 1) + matched PDFs in requirements[].order + footer
+ * "<tender_id> | Page X of Y" on every page + "<tender_id>_Package.pdf" download.
+ * Assembly logic lives in js/pdf-generator.js; status rules in js/validator.js.
  */
 
 (function () {
@@ -27,11 +29,15 @@
   // ---------- State (single source of truth) ----------
   var uploadedFiles = []; // { id, file, name, size, pageCount, hash }
   var matches = {}; // reqId -> fileId (single source of truth for document matching)
+  var expiryDates = {}; // reqId -> "YYYY-MM-DD" (only for requirements with has_expiry)
+  var submissionDeadline = null; // "YYYY-MM-DD" from requirements.json tender data
   var idCounter = 0;
   // Reservations for files currently being read (prevents limit bypass on overlapping batches).
   var pendingCount = 0;
   var pendingBytes = 0;
   var activeBatches = 0;
+  var cachedTender = null; // tender object from requirements.json (source of truth)
+  var isGenerating = false; // guards against double-click generation
 
   var currentLang = "en";
   var cachedRequirements = null;
@@ -275,7 +281,10 @@
   }
 
   function refreshChecklist() {
-    if (cachedRequirements) renderChecklist(cachedRequirements);
+    if (cachedRequirements) {
+      renderChecklist(cachedRequirements);
+      refreshValidation(); // statuses + summary + button follow every checklist change
+    }
   }
 
   function setMatch(reqId, fileId) {
@@ -331,6 +340,75 @@
     return '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600 border border-slate-200">Optional</span>';
   }
 
+  // ---------- Phase 4: validation wiring (rules live in js/validator.js) ----------
+
+  function validator() {
+    return window.TenderValidator || null;
+  }
+
+  function statusOf(req) {
+    var v = validator();
+    if (!v) return "MISSING"; // validator script missing: fail closed (blocking)
+    return v.getRequirementStatus(req, {
+      matched: !!matchedFileFor(req.id),
+      expiryDate: expiryDates[req.id] || "",
+      deadline: submissionDeadline
+    });
+  }
+
+  function statusBadgeHtml(status) {
+    var v = validator();
+    var label = "Pending";
+    var cls = "bg-slate-100 text-slate-600 border-slate-200";
+    if (v) {
+      if (status === v.STATUS.MISSING) { label = "🔴 Missing"; cls = "bg-red-50 text-red-700 border-red-200"; }
+      else if (status === v.STATUS.EXPIRY_NEEDED) { label = "🟠 Expiry Date Needed"; cls = "bg-orange-50 text-orange-800 border-orange-200"; }
+      else if (status === v.STATUS.EXPIRED) { label = "🔴 Expired"; cls = "bg-red-50 text-red-700 border-red-200"; }
+      else if (status === v.STATUS.NOT_PROVIDED) { label = "⚪ Not Provided"; cls = "bg-slate-100 text-slate-600 border-slate-200"; }
+      else if (status === v.STATUS.OK) { label = "🟢 OK"; cls = "bg-emerald-50 text-emerald-700 border-emerald-200"; }
+    }
+    return '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border ' + cls + '">' + escapeHtml(label) + '</span>';
+  }
+
+  function updateGenerateButton() {
+    var btn = document.getElementById("generate-btn");
+    var hint = document.getElementById("generate-hint");
+    if (!btn) return;
+    var v = validator();
+    var blocking = true;
+    if (v && cachedRequirements) {
+      blocking = v.hasBlockingIssues(cachedRequirements.map(function (r) { return statusOf(r); }));
+    }
+    if (blocking) {
+      btn.disabled = true;
+      btn.setAttribute("aria-disabled", "true");
+      btn.className = "inline-flex items-center justify-center px-5 py-2.5 rounded-lg bg-slate-200 text-slate-400 text-sm font-medium cursor-not-allowed";
+      if (hint) { hint.className = "text-xs text-slate-500"; hint.textContent = "Resolve all blocking issues before generating the package."; }
+    } else {
+      btn.disabled = false;
+      btn.setAttribute("aria-disabled", "false");
+      btn.className = "inline-flex items-center justify-center px-5 py-2.5 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2";
+      if (hint) { hint.className = "text-xs text-slate-500"; hint.textContent = "All documents are valid. The package is ready to generate."; }
+    }
+  }
+
+  // Refresh only the status column + summary + button (keeps expiry-input focus).
+  function refreshValidation() {
+    if (!cachedRequirements) return;
+    cachedRequirements.forEach(function (req) {
+      var cell = checklistBody ? checklistBody.querySelector('[data-status-for="' + req.id + '"]') : null;
+      if (cell) cell.innerHTML = statusBadgeHtml(statusOf(req));
+    });
+    renderSummary(cachedRequirements);
+    updateGenerateButton();
+  }
+
+  function setExpiry(reqId, value) {
+    if (value) expiryDates[reqId] = String(value).slice(0, 10);
+    else delete expiryDates[reqId];
+    refreshValidation();
+  }
+
   function statusHtml() {
     return '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600 border border-slate-200">Pending</span>';
   }
@@ -344,7 +422,7 @@
         var name = currentLang === "bn" ? req.title_bn : req.title_en;
         var sub = currentLang === "bn" ? req.title_en : req.title_bn;
         var expiryCell = req.has_expiry
-          ? '<input type="date" disabled placeholder="YYYY-MM-DD" aria-label="Expiry date for ' + escapeHtml(req.title_en) + '" class="w-36 px-2 py-1 text-xs rounded-lg border border-slate-200" />'
+          ? '<input type="date" data-expiry="' + escapeHtml(req.id) + '" value="' + escapeHtml(expiryDates[req.id] || "") + '" aria-label="Expiry date for ' + escapeHtml(req.title_en) + '" class="expiry-input w-36 px-2 py-1 text-xs rounded-lg border border-slate-200 bg-white" />'
           : '<span class="text-xs text-slate-300">—</span>';
         return (
           '<tr class="hover:bg-slate-50">' +
@@ -356,7 +434,7 @@
             '<td class="px-4 py-3">' + badgeHtml(req.mandatory) + '</td>' +
             '<td class="px-4 py-3">' + matchedCellHtml(req) + '</td>' +
             '<td class="px-4 py-3">' + expiryCell + '</td>' +
-            '<td class="px-4 py-3">' + statusHtml() + '</td>' +
+            '<td class="px-4 py-3" data-status-for="' + escapeHtml(req.id) + '">' + statusBadgeHtml(statusOf(req)) + '</td>' +
             '<td class="px-5 py-3 text-right">' +
               '<select data-match="' + escapeHtml(req.id) + '" aria-label="Match PDF for ' + escapeHtml(req.title_en) + '" ' +
               'class="match-select w-56 px-2 py-1.5 text-xs rounded-lg border border-slate-200 bg-white text-slate-700">' +
@@ -370,21 +448,35 @@
   }
 
   function renderSummary(requirements) {
-    if (!requirements) return;
-    var total = requirements.length;
-    var mandatory = requirements.filter(function (r) { return r.mandatory; }).length;
-    var set = function (id, v) {
+    var v = validator();
+    var list = requirements || [];
+    var set = function (id, val) {
       var el = document.getElementById(id);
-      if (el) el.textContent = String(v);
+      if (el) el.textContent = String(val);
     };
-    set("stat-total", total);
-    set("stat-mandatory", mandatory);
-    set("stat-ready", 0);
-    set("stat-blocking", mandatory); // placeholder until later phases
+    if (!v) {
+      // Fail closed when validator.js is missing: mandatory all blocking.
+      var mandatory = list.filter(function (r) { return r && r.mandatory; }).length;
+      set("stat-total", list.length);
+      set("stat-mandatory", mandatory);
+      set("stat-ready", 0);
+      set("stat-blocking", mandatory);
+      updateGenerateButton();
+      return;
+    }
+    var s = v.calculateSummary(list, function (r) { return statusOf(r); });
+    set("stat-total", s.total);
+    set("stat-mandatory", s.mandatory);
+    set("stat-ready", s.ready);
+    set("stat-blocking", s.blocking);
+    updateGenerateButton();
   }
 
   function renderAll(data) {
     cachedRequirements = data.requirements;
+    cachedTender = data.tender || null;
+    submissionDeadline = data.tender && data.tender.submission_deadline
+      ? String(data.tender.submission_deadline).slice(0, 10) : null;
     renderTenderInfo(data.tender);
     renderChecklist(data.requirements);
     renderSummary(data.requirements);
@@ -538,6 +630,83 @@
     });
   }
 
+  // ---------- Phase 5: generate + download ----------
+
+  function setGenerateBusy(busy, label) {
+    var btn = document.getElementById("generate-btn");
+    var hint = document.getElementById("generate-hint");
+    if (busy) {
+      if (btn) {
+        btn.disabled = true;
+        btn.setAttribute("aria-disabled", "true");
+        btn.className = "inline-flex items-center justify-center px-5 py-2.5 rounded-lg bg-slate-400 text-white text-sm font-medium cursor-wait";
+      }
+      if (hint) hint.textContent = label || "Generating package…";
+    } else {
+      updateGenerateButton(); // restore Phase 4 state
+    }
+  }
+
+  function showGenerateMessage(msg, isError) {
+    var hint = document.getElementById("generate-hint");
+    if (!hint) return;
+    hint.textContent = msg;
+    hint.className = "text-xs " + (isError ? "text-red-600 font-medium" : "text-emerald-700 font-medium");
+  }
+
+  function handleGenerate() {
+    if (isGenerating) return; // no double-click generation
+    var v = validator();
+    if (!v || !window.PackageGenerator) {
+      showGenerateMessage("Unable to generate the package. Please reload the page and try again.", true);
+      return;
+    }
+    if (!cachedRequirements) {
+      showGenerateMessage("Unable to generate the package. Requirements are still loading.", true);
+      return;
+    }
+    var statuses = cachedRequirements.map(function (r) { return statusOf(r); });
+    if (v.hasBlockingIssues(statuses)) {
+      showGenerateMessage("Resolve all blocking issues before generating the package.", true);
+      updateGenerateButton();
+      return;
+    }
+    isGenerating = true;
+    setGenerateBusy(true, "Generating package…");
+    var tender = cachedTender || (fallbackData && fallbackData.tender) || {};
+    window.PackageGenerator.generatePackagePdf({
+      tender: tender,
+      requirements: cachedRequirements,
+      matches: matches,
+      filesById: fileById,
+      statusOf: statusOf,
+      isOkStatus: function (st) { return st === v.STATUS.OK; },
+      lang: currentLang
+    }, function (msg) {
+      setGenerateBusy(true, msg);
+    }).then(function (result) {
+      isGenerating = false;
+      var blob = new Blob([result.bytes], { type: "application/pdf" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = result.filename;
+      document.body.appendChild(a);
+      a.click();
+      if (a.remove) a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      updateGenerateButton();
+      showGenerateMessage("Package generated successfully: " + result.filename +
+        " (" + result.totalPages + (result.totalPages === 1 ? " page" : " pages") +
+        ", " + result.includedCount + " documents).");
+    }).catch(function (err) {
+      isGenerating = false;
+      if (err) console.error("[package]", err && err.message ? err.message : err);
+      updateGenerateButton();
+      showGenerateMessage("Unable to generate the package. Please check the uploaded PDF files and try again.", true);
+    });
+  }
+
   // ---------- Events ----------
   if (fileInput) {
     fileInput.addEventListener("change", function () {
@@ -549,9 +718,15 @@
 
   if (checklistBody) {
     checklistBody.addEventListener("change", function (e) {
-      var sel = e.target && e.target.getAttribute ? e.target : null;
-      if (!sel || !sel.getAttribute("data-match")) return;
-      setMatch(sel.getAttribute("data-match"), sel.value);
+      var t = e.target && e.target.getAttribute ? e.target : null;
+      if (!t) return;
+      if (t.getAttribute("data-match")) {
+        setMatch(t.getAttribute("data-match"), t.value);
+        return;
+      }
+      if (t.getAttribute("data-expiry")) {
+        setExpiry(t.getAttribute("data-expiry"), t.value);
+      }
     });
   }
 
@@ -603,9 +778,13 @@
   if (langEnBtn) langEnBtn.addEventListener("click", function () { setLang("en"); });
   if (langBnBtn) langBnBtn.addEventListener("click", function () { setLang("bn"); });
 
+  var generateBtn = document.getElementById("generate-btn");
+  if (generateBtn) generateBtn.addEventListener("click", handleGenerate);
+
   // ---------- Init ----------
   renderFiles();
   renderAll(fallbackData);
+  updateGenerateButton();
   fetch("requirements.json", { cache: "no-store" })
     .then(function (res) {
       if (!res.ok) throw new Error("HTTP " + res.status);
