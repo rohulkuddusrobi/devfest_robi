@@ -1,0 +1,26 @@
+/* Minimal custom styles — layout is handled by Tailwind utility classes. */
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+/* Drag-over highlight for the visual-only dropzone (toggled by js/app.js) */
+#dropzone.drag-over {
+  border-color: #0f172a;
+  background-color: #f1f5f9;
+}
+
+/* Disabled expiry placeholder */
+input[type="date"]:disabled {
+  background-color: #f8fafc;
+  color: #94a3b8;
+  cursor: not-allowed;
+}
+
+/* Visible focus for keyboard users */
+button:focus-visible,
+label:focus-visible,
+input:focus-visible {
+  outline: 2px solid #0f172a;
+  outline-offset: 2px;
+}
